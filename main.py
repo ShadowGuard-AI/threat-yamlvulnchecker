@@ -5,14 +5,21 @@ import logging
 import yaml
 import os
 import sys
-from networkx import DiGraph, all_simple_paths
-from dotenv import load_dotenv
+import hashlib
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Load environment variables from .env file (if present)
-load_dotenv()
+ABSENT = object()
+
+def mask_value(v):
+    if v is None:
+        return "None (masked)"
+    s = str(v)
+    digest = hashlib.sha256(s.encode()).hexdigest()[:8]
+    return f"*** (len={len(s)}, sha256:{digest})"
+
+
 
 
 class YamlVulnChecker:
@@ -29,6 +36,10 @@ class YamlVulnChecker:
         self.yaml_data = None
         self.rules = None
         self.vulnerabilities = []
+        self.rule_errors = 0
+        self.skipped_absent = 0
+        self._yaml_loaded = False
+        self._rules_loaded = False
 
     def load_yaml(self):
         """
@@ -38,6 +49,7 @@ class YamlVulnChecker:
         try:
             with open(self.yaml_file, 'r') as f:
                 self.yaml_data = yaml.safe_load(f)
+                self._yaml_loaded = True
             logging.info(f"Successfully loaded YAML file: {self.yaml_file}")
         except FileNotFoundError:
             logging.error(f"YAML file not found: {self.yaml_file}")
@@ -54,6 +66,7 @@ class YamlVulnChecker:
         try:
             with open(self.ruleset_file, 'r') as f:
                 self.rules = yaml.safe_load(f)
+                self._rules_loaded = True
             logging.info(f"Successfully loaded ruleset file: {self.ruleset_file}")
         except FileNotFoundError:
             logging.error(f"Ruleset file not found: {self.ruleset_file}")
@@ -63,67 +76,60 @@ class YamlVulnChecker:
             raise
 
     def check_rules(self):
-        """
-        Applies the ruleset to the loaded YAML data and identifies potential vulnerabilities.
-        """
-        # An empty document loads as None and lands on this same guard. The cause named in the
-        # error is loading order, when the real cause is that there was nothing in the file.
-        if not self.yaml_data:
+        if not self._yaml_loaded:
             logging.error("YAML data not loaded.  Call load_yaml() first.")
             raise ValueError("YAML data not loaded")
-
-        if not self.rules:
+        if self.yaml_data is None:
+            logging.error("YAML file was empty or produced no data.")
+            raise ValueError("YAML file was empty or produced no data")
+        if not self._rules_loaded:
             logging.error("Ruleset not loaded. Call load_ruleset() first.")
             raise ValueError("Ruleset not loaded")
-
+        if not self.rules:
+            logging.error("Ruleset was empty or produced no data.")
+            raise ValueError("Ruleset was empty or produced no data")
         self.vulnerabilities = []
+        self.rule_errors = 0
+        self.skipped_absent = 0
         for rule in self.rules:
             name = rule.get("name")
             description = rule.get("description")
             path = rule.get("path")
-            check_type = rule.get("type", "equality")  # Default to equality if not specified
+            check_type = rule.get("type", "equality")
             value = rule.get("value")
-            severity = rule.get("severity", "medium") # Default to medium severity
-
+            severity = rule.get("severity", "medium")
             try:
                 extracted_value = self._extract_value(self.yaml_data, path)
-
-                # None means two different things on this line: the path is absent, or it is present
-                # and set to null. A rule written against an explicit null can never fire here.
-                if extracted_value is None:
-                    logging.debug(f"Path {path} not found in YAML data.")
+                if extracted_value is ABSENT:
+                    expects_present = bool(rule.get("required") or rule.get("expect_present") or rule.get("treat_absence_as_finding") or check_type in ("missing", "absent", "exists"))
+                    if expects_present or check_type in ("missing", "absent"):
+                        self.vulnerabilities.append({
+                            "name": name, "description": description, "path": path,
+                            "value": value, "actual_value": "<absent>", "severity": severity})
+                        logging.warning(f"Vulnerability found: {name} at path {path} (path absent)")
+                    else:
+                        self.skipped_absent += 1
+                        logging.info(f"Rule {name}: path {path} absent, not evaluated.")
                     continue
-
                 if check_type == "equality":
-                    if extracted_value == value:
-                        self.vulnerabilities.append({
-                            "name": name,
-                            "description": description,
-                            "path": path,
-                            "value": value,
-                            "actual_value": extracted_value,
-                            "severity": severity
-                        })
-                        logging.warning(f"Vulnerability found: {name} at path {path}")
+                    matched = extracted_value == value
                 elif check_type == "contains":
-                    # contains stringifies whatever it found first. A rule value of 80 matches a port of
-                    # 8080, and a word matches inside the printed form of a list or a mapping.
-                    if value in str(extracted_value): # Convert to string for broader matching
-                        self.vulnerabilities.append({
-                            "name": name,
-                            "description": description,
-                            "path": path,
-                            "value": value,
-                            "actual_value": extracted_value,
-                            "severity": severity
-                        })
-                        logging.warning(f"Vulnerability found: {name} at path {path}")
+                    matched = str(value) in str(extracted_value)
+                elif check_type in ("missing", "absent"):
+                    matched = False
+                elif check_type == "exists":
+                    matched = False
                 else:
-                    # An unknown check type logs and moves on, and the run still ends at exit 0 with a
-                    # clean sounding report. A typo in the ruleset looks the same as a pass.
                     logging.error(f"Invalid check type: {check_type}")
-
+                    self.rule_errors += 1
+                    continue
+                if matched:
+                    self.vulnerabilities.append({
+                        "name": name, "description": description, "path": path,
+                        "value": value, "actual_value": extracted_value, "severity": severity})
+                    logging.warning(f"Vulnerability found: {name} at path {path}")
             except Exception as e:
+                self.rule_errors += 1
                 logging.error(f"Error checking rule {name}: {e}")
 
     def _extract_value(self, data, path):
@@ -143,36 +149,36 @@ class YamlVulnChecker:
                         index = int(part)
                         current = current[index]
                     except ValueError:
-                        return None
+                        return ABSENT
                     except IndexError:
-                        return None
+                        return ABSENT
                 else:
-                    return None  # Path not found
+                    return ABSENT  # Path not found
             return current
         except Exception:
-            return None
+            return ABSENT
 
     def report_vulnerabilities(self):
-        """
-        Prints a report of the found vulnerabilities.
-        """
+        if self.rule_errors:
+            print(f"Rule errors: {self.rule_errors} rule(s) could not be evaluated.")
+        if self.skipped_absent:
+            print(f"Rules not evaluated (path absent): {self.skipped_absent}")
         if self.vulnerabilities:
             print("Vulnerabilities found:")
             for vuln in self.vulnerabilities:
                 print(f"  - Name: {vuln['name']}")
                 print(f"    Description: {vuln['description']}")
                 print(f"    Path: {vuln['path']}")
-                print(f"    Expected Value: {vuln['value']}")
-                print(f"    Actual Value: {vuln['actual_value']}")
+                print(f"    Expected Value: {mask_value(vuln['value'])}")
+                print(f"    Actual Value: {mask_value(vuln['actual_value'])}")
                 print(f"    Severity: {vuln['severity']}")
                 print("-" * 20)
-        else:
+        elif not self.rule_errors:
             print("No vulnerabilities found.")
+        else:
+            print("No clean result: some rules could not be evaluated.")
 
     def run(self):
-        """
-        Runs the vulnerability check process.
-        """
         try:
             self.load_yaml()
             self.load_ruleset()
@@ -180,7 +186,12 @@ class YamlVulnChecker:
             self.report_vulnerabilities()
         except Exception as e:
             logging.error(f"An error occurred: {e}")
-            sys.exit(1)
+            return 1
+        if self.rule_errors:
+            return 1
+        if self.vulnerabilities:
+            return 1
+        return 0
 
 
 def setup_argparse():
@@ -207,7 +218,7 @@ def main():
 
     try:
         checker = YamlVulnChecker(args.yaml_file, args.ruleset_file)
-        checker.run()
+        sys.exit(checker.run())
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
         sys.exit(1)
