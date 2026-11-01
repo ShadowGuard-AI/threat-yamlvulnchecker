@@ -66,6 +66,8 @@ class YamlVulnChecker:
         """
         Applies the ruleset to the loaded YAML data and identifies potential vulnerabilities.
         """
+        # An empty document loads as None and lands on this same guard. The cause named in the
+        # error is loading order, when the real cause is that there was nothing in the file.
         if not self.yaml_data:
             logging.error("YAML data not loaded.  Call load_yaml() first.")
             raise ValueError("YAML data not loaded")
@@ -86,6 +88,8 @@ class YamlVulnChecker:
             try:
                 extracted_value = self._extract_value(self.yaml_data, path)
 
+                # None means two different things on this line: the path is absent, or it is present
+                # and set to null. A rule written against an explicit null can never fire here.
                 if extracted_value is None:
                     logging.debug(f"Path {path} not found in YAML data.")
                     continue
@@ -102,6 +106,8 @@ class YamlVulnChecker:
                         })
                         logging.warning(f"Vulnerability found: {name} at path {path}")
                 elif check_type == "contains":
+                    # contains stringifies whatever it found first. A rule value of 80 matches a port of
+                    # 8080, and a word matches inside the printed form of a list or a mapping.
                     if value in str(extracted_value): # Convert to string for broader matching
                         self.vulnerabilities.append({
                             "name": name,
@@ -113,6 +119,8 @@ class YamlVulnChecker:
                         })
                         logging.warning(f"Vulnerability found: {name} at path {path}")
                 else:
+                    # An unknown check type logs and moves on, and the run still ends at exit 0 with a
+                    # clean sounding report. A typo in the ruleset looks the same as a pass.
                     logging.error(f"Invalid check type: {check_type}")
 
             except Exception as e:
@@ -123,6 +131,8 @@ class YamlVulnChecker:
         Helper function to extract a value from the YAML data based on a path (dot notation).
         """
         try:
+            # Splitting the path on dots means a key that itself contains a dot cannot be reached.
+            # Annotation style keys in real YAML are exactly that shape.
             parts = path.split('.')
             current = data
             for part in parts:
