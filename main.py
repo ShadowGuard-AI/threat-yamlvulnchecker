@@ -91,7 +91,21 @@ class YamlVulnChecker:
         self.vulnerabilities = []
         self.rule_errors = 0
         self.skipped_absent = 0
-        for rule in self.rules:
+        rules = self.rules
+        if isinstance(rules, dict):
+            # Accept a ruleset wrapped in a top-level mapping with a
+            # "rules" list, a common shape for ruleset files.
+            rules = rules.get("rules")
+            if not isinstance(rules, list):
+                logging.error("Ruleset mapping has no 'rules' list.")
+                raise ValueError("Ruleset mapping has no 'rules' list")
+        for rule in rules:
+            if not isinstance(rule, dict):
+                # One malformed entry must not abort the whole run:
+                # count it as a rule error and evaluate the rest.
+                self.rule_errors += 1
+                logging.error(f"Invalid rule entry, not a mapping: {rule!r}")
+                continue
             name = rule.get("name")
             description = rule.get("description")
             path = rule.get("path")
